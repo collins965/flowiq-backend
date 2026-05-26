@@ -240,16 +240,16 @@ def check_free_tier_limit(user) -> Tuple[bool, int]:
 
 
 def increment_query_count(user) -> None:
-    """Increment the monthly AI query counter. Only affects free users."""
+    """Increment monthly AI query counter atomically — no race condition."""
     profile = getattr(user, "profile", None)
     if profile is None:
         return
     if getattr(profile, "plan", "free") == "free":
-        profile.ai_queries_this_month = (
-            getattr(profile, "ai_queries_this_month", 0) + 1
+        from django.db.models import F
+        from core.models import Profile
+        Profile.objects.filter(id=profile.id).update(
+            ai_queries_this_month=F("ai_queries_this_month") + 1
         )
-        profile.save(update_fields=["ai_queries_this_month"])
-
 
 def save_conversation(
     user,
