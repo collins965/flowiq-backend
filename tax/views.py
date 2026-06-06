@@ -1,48 +1,52 @@
+"""
+tax/views.py
+
+Endpoints:
+  GET    /api/tax/settings/    → get or create tax settings
+  PATCH  /api/tax/settings/    → update tax settings
+  POST   /api/tax/calculate/   → run full tax calculation
+  GET    /api/tax/history/     → past calculations
+  GET    /api/tax/rates/       → KRA + global rate reference
+"""
+
+import logging
+from datetime import date
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny
 from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
 
-# ─────────────────────────────────────────────
-# KENYA — KRA 2024/2025
-# ─────────────────────────────────────────────
-KE_PAYE_BANDS = [
-    {"lower": 0,      "upper": 24000,       "rate": 0.10},
-    {"lower": 24001,  "upper": 32333,       "rate": 0.25},
-    {"lower": 32334,  "upper": 500000,      "rate": 0.30},
-    {"lower": 500001, "upper": 800000,      "rate": 0.325},
-    {"lower": 800001, "upper": float("inf"),"rate": 0.35},
-]
-KE_PERSONAL_RELIEF = 2400
-KE_NHIF_TABLE = [
-    {"max": 5999,         "amount": 150},
-    {"max": 7999,         "amount": 300},
-    {"max": 11999,        "amount": 400},
-    {"max": 14999,        "amount": 500},
-    {"max": 19999,        "amount": 600},
-    {"max": 24999,        "amount": 750},
-    {"max": 29999,        "amount": 850},
-    {"max": 34999,        "amount": 900},
-    {"max": 39999,        "amount": 950},
-    {"max": 44999,        "amount": 1000},
-    {"max": 49999,        "amount": 1100},
-    {"max": 59999,        "amount": 1200},
-    {"max": 69999,        "amount": 1300},
-    {"max": 79999,        "amount": 1400},
-    {"max": 89999,        "amount": 1500},
-    {"max": 99999,        "amount": 1600},
-    {"max": float("inf"),"amount": 1700},
-]
+from .models import TaxSettings, TaxCalculation
+from .serializers import (
+    TaxSettingsSerializer,
+    TaxCalculateSerializer,
+    TaxCalculationHistorySerializer,
+)
+from .engine import (
+    calculate_employed,
+    calculate_self_employed,
+    calculate_combined,
+    PAYE_BANDS,
+    PERSONAL_RELIEF_MONTHLY,
+    NHIF_TIERS,
+    NSSF_TIER_1_MAX,
+    NSSF_TIER_2_MAX,
+    TURNOVER_TAX_RATE,
+    d,
+)
 
-# ─────────────────────────────────────────────
-# COUNTRY TAX CONFIGS
-# Annual income bands → converted to monthly internally
-# ─────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global tax configurations
+# All bands are ANNUAL income. Converted to monthly internally.
+# ─────────────────────────────────────────────────────────────────────────────
+
 COUNTRY_TAX_CONFIGS = {
-    # USA — Federal income tax 2024 (single filer, annual)
     "US": {
-        "name": "United States",
-        "currency": "USD",
+        "name": "United States", "currency": "USD",
         "bands": [
             {"lower": 0,       "upper": 11600,  "rate": 0.10},
             {"lower": 11600,   "upper": 47150,  "rate": 0.12},
@@ -52,30 +56,24 @@ COUNTRY_TAX_CONFIGS = {
             {"lower": 243725,  "upper": 609350, "rate": 0.35},
             {"lower": 609350,  "upper": float("inf"), "rate": 0.37},
         ],
-        "standard_deduction": 14600,  # annual
-        "social_security_rate": 0.062,
-        "social_security_cap": 160200,
+        "standard_deduction": 14600,
+        "social_security_rate": 0.062, "social_security_cap": 160200,
         "medicare_rate": 0.0145,
         "notes": "Federal tax only. State taxes vary.",
     },
-    # UK — PAYE 2024/25 (annual)
     "GB": {
-        "name": "United Kingdom",
-        "currency": "GBP",
+        "name": "United Kingdom", "currency": "GBP",
         "bands": [
             {"lower": 0,      "upper": 12570,  "rate": 0.0},
             {"lower": 12570,  "upper": 50270,  "rate": 0.20},
             {"lower": 50270,  "upper": 125140, "rate": 0.40},
             {"lower": 125140, "upper": float("inf"), "rate": 0.45},
         ],
-        "ni_rate": 0.08,
-        "ni_threshold": 12570,
+        "ni_rate": 0.08, "ni_threshold": 12570,
         "notes": "Includes National Insurance (8% above threshold).",
     },
-    # Canada — Federal 2024 (annual)
     "CA": {
-        "name": "Canada",
-        "currency": "CAD",
+        "name": "Canada", "currency": "CAD",
         "bands": [
             {"lower": 0,       "upper": 55867,  "rate": 0.15},
             {"lower": 55867,   "upper": 111733, "rate": 0.205},
@@ -84,15 +82,12 @@ COUNTRY_TAX_CONFIGS = {
             {"lower": 220000,  "upper": float("inf"), "rate": 0.33},
         ],
         "basic_personal_amount": 15705,
-        "cpp_rate": 0.0595,
-        "cpp_cap": 68500,
+        "cpp_rate": 0.0595, "cpp_cap": 68500,
         "ei_rate": 0.0166,
         "notes": "Federal tax only. Provincial taxes vary.",
     },
-    # Australia — ATO 2024/25 (annual)
     "AU": {
-        "name": "Australia",
-        "currency": "AUD",
+        "name": "Australia", "currency": "AUD",
         "bands": [
             {"lower": 0,       "upper": 18200,  "rate": 0.0},
             {"lower": 18200,   "upper": 45000,  "rate": 0.19},
@@ -103,24 +98,19 @@ COUNTRY_TAX_CONFIGS = {
         "medicare_levy": 0.02,
         "notes": "Includes 2% Medicare Levy.",
     },
-    # Germany — simplified 2024 (annual)
     "DE": {
-        "name": "Germany",
-        "currency": "EUR",
+        "name": "Germany", "currency": "EUR",
         "bands": [
             {"lower": 0,       "upper": 11604,  "rate": 0.0},
             {"lower": 11604,   "upper": 66760,  "rate": 0.14},
             {"lower": 66760,   "upper": 277826, "rate": 0.42},
             {"lower": 277826,  "upper": float("inf"), "rate": 0.45},
         ],
-        "solidarity_surcharge": 0.055,
-        "social_security_rate": 0.195,
+        "solidarity_surcharge": 0.055, "social_security_rate": 0.195,
         "notes": "Includes solidarity surcharge. Social security approx 19.5%.",
     },
-    # Nigeria — PITA (annual)
     "NG": {
-        "name": "Nigeria",
-        "currency": "NGN",
+        "name": "Nigeria", "currency": "NGN",
         "bands": [
             {"lower": 0,         "upper": 300000,   "rate": 0.07},
             {"lower": 300000,    "upper": 600000,   "rate": 0.11},
@@ -132,10 +122,8 @@ COUNTRY_TAX_CONFIGS = {
         "consolidated_relief": 200000,
         "notes": "Personal Income Tax Act. Consolidated Relief Allowance applies.",
     },
-    # South Africa — SARS 2024/25 (annual)
     "ZA": {
-        "name": "South Africa",
-        "currency": "ZAR",
+        "name": "South Africa", "currency": "ZAR",
         "bands": [
             {"lower": 0,        "upper": 237100,  "rate": 0.18},
             {"lower": 237100,   "upper": 370500,  "rate": 0.26},
@@ -145,15 +133,11 @@ COUNTRY_TAX_CONFIGS = {
             {"lower": 857900,   "upper": 1817000, "rate": 0.41},
             {"lower": 1817000,  "upper": float("inf"), "rate": 0.45},
         ],
-        "primary_rebate": 17235,
-        "uif_rate": 0.01,
-        "uif_cap": 177624,
+        "primary_rebate": 17235, "uif_rate": 0.01, "uif_cap": 177624,
         "notes": "UIF contribution 1% capped at ZAR 177,624 annual.",
     },
-    # Ghana — GRA 2024 (annual)
     "GH": {
-        "name": "Ghana",
-        "currency": "GHS",
+        "name": "Ghana", "currency": "GHS",
         "bands": [
             {"lower": 0,      "upper": 4380,   "rate": 0.0},
             {"lower": 4380,   "upper": 5460,   "rate": 0.05},
@@ -166,23 +150,19 @@ COUNTRY_TAX_CONFIGS = {
         "ssnit_rate": 0.055,
         "notes": "SSNIT contribution 5.5% of gross.",
     },
-    # Uganda — URA 2024/25 (annual)
     "UG": {
-        "name": "Uganda",
-        "currency": "UGX",
+        "name": "Uganda", "currency": "UGX",
         "bands": [
-            {"lower": 0,          "upper": 2820000,  "rate": 0.0},
-            {"lower": 2820000,    "upper": 4920000,  "rate": 0.10},
-            {"lower": 4920000,    "upper": 120000000,"rate": 0.20},
+            {"lower": 0,          "upper": 2820000,   "rate": 0.0},
+            {"lower": 2820000,    "upper": 4920000,   "rate": 0.10},
+            {"lower": 4920000,    "upper": 120000000, "rate": 0.20},
             {"lower": 120000000,  "upper": float("inf"), "rate": 0.30},
         ],
         "nssf_rate": 0.05,
         "notes": "NSSF employee contribution 5%.",
     },
-    # Tanzania — TRA 2024 (annual)
     "TZ": {
-        "name": "Tanzania",
-        "currency": "TZS",
+        "name": "Tanzania", "currency": "TZS",
         "bands": [
             {"lower": 0,          "upper": 3240000,  "rate": 0.0},
             {"lower": 3240000,    "upper": 6240000,  "rate": 0.08},
@@ -193,10 +173,8 @@ COUNTRY_TAX_CONFIGS = {
         "nssf_rate": 0.05,
         "notes": "NSSF employee contribution 5%.",
     },
-    # Rwanda — RRA 2024 (annual)
     "RW": {
-        "name": "Rwanda",
-        "currency": "RWF",
+        "name": "Rwanda", "currency": "RWF",
         "bands": [
             {"lower": 0,        "upper": 360000,  "rate": 0.0},
             {"lower": 360000,   "upper": 1200000, "rate": 0.20},
@@ -205,10 +183,8 @@ COUNTRY_TAX_CONFIGS = {
         "rssb_rate": 0.03,
         "notes": "RSSB employee pension 3%.",
     },
-    # Ethiopia — ERCA (annual)
     "ET": {
-        "name": "Ethiopia",
-        "currency": "ETB",
+        "name": "Ethiopia", "currency": "ETB",
         "bands": [
             {"lower": 0,      "upper": 7200,   "rate": 0.0},
             {"lower": 7200,   "upper": 19800,  "rate": 0.10},
@@ -221,10 +197,8 @@ COUNTRY_TAX_CONFIGS = {
         "pension_rate": 0.07,
         "notes": "Employee pension contribution 7%.",
     },
-    # India — New Tax Regime 2024/25 (annual, INR)
     "IN": {
-        "name": "India",
-        "currency": "INR",
+        "name": "India", "currency": "INR",
         "bands": [
             {"lower": 0,        "upper": 300000,  "rate": 0.0},
             {"lower": 300000,   "upper": 600000,  "rate": 0.05},
@@ -233,24 +207,16 @@ COUNTRY_TAX_CONFIGS = {
             {"lower": 1200000,  "upper": 1500000, "rate": 0.20},
             {"lower": 1500000,  "upper": float("inf"), "rate": 0.30},
         ],
-        "standard_deduction": 50000,
-        "pf_rate": 0.12,
-        "pf_cap": 1800000,
+        "standard_deduction": 50000, "pf_rate": 0.12, "pf_cap": 1800000,
         "notes": "New tax regime. PF contribution 12% up to INR 15,000/month.",
     },
-    # UAE — 0% income tax
     "AE": {
-        "name": "United Arab Emirates",
-        "currency": "AED",
-        "bands": [
-            {"lower": 0, "upper": float("inf"), "rate": 0.0},
-        ],
+        "name": "United Arab Emirates", "currency": "AED",
+        "bands": [{"lower": 0, "upper": float("inf"), "rate": 0.0}],
         "notes": "No personal income tax in UAE.",
     },
-    # France (annual)
     "FR": {
-        "name": "France",
-        "currency": "EUR",
+        "name": "France", "currency": "EUR",
         "bands": [
             {"lower": 0,       "upper": 11294,  "rate": 0.0},
             {"lower": 11294,   "upper": 28797,  "rate": 0.11},
@@ -261,10 +227,8 @@ COUNTRY_TAX_CONFIGS = {
         "social_security_rate": 0.22,
         "notes": "Includes approx 22% social contributions.",
     },
-    # Singapore (annual, SGD)
     "SG": {
-        "name": "Singapore",
-        "currency": "SGD",
+        "name": "Singapore", "currency": "SGD",
         "bands": [
             {"lower": 0,       "upper": 20000,  "rate": 0.0},
             {"lower": 20000,   "upper": 30000,  "rate": 0.02},
@@ -283,284 +247,264 @@ COUNTRY_TAX_CONFIGS = {
     },
 }
 
-# ─────────────────────────────────────────────
-# FALLBACK — income-based flat rate estimate
-# for countries not explicitly configured
-# ─────────────────────────────────────────────
-def get_fallback_rate(annual_income_usd: float) -> float:
-    if annual_income_usd <= 10000:
-        return 0.05
-    elif annual_income_usd <= 25000:
-        return 0.12
-    elif annual_income_usd <= 50000:
-        return 0.18
-    elif annual_income_usd <= 100000:
-        return 0.24
-    elif annual_income_usd <= 200000:
-        return 0.30
-    else:
-        return 0.35
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# SHARED HELPERS
-# ─────────────────────────────────────────────
 def calculate_progressive_tax(annual_income: float, bands: list) -> float:
-    tax = 0
-    prev = 0
+    tax = 0.0
     for band in bands:
-        taxable = min(max(annual_income - prev, 0), band["upper"] - band["lower"])
-        tax += taxable * band["rate"]
-        prev = band["upper"]
-        if annual_income <= band["upper"]:
+        lower = band["lower"]
+        upper = band["upper"]
+        rate = band["rate"]
+        if annual_income <= lower:
             break
+        taxable = min(annual_income, upper) - lower
+        if taxable > 0:
+            tax += taxable * rate
     return tax
 
 
 def get_marginal_rate(annual_income: float, bands: list) -> float:
-    rate = 0
+    rate = 0.0
     for band in bands:
         if annual_income >= band["lower"]:
             rate = band["rate"] * 100
     return rate
 
 
-# ─────────────────────────────────────────────
-# KENYA-SPECIFIC HELPERS
-# ─────────────────────────────────────────────
-def calculate_ke_paye(monthly_gross: float) -> float:
-    tax = 0
-    remaining = monthly_gross
-    prev = 0
-    for band in KE_PAYE_BANDS:
-        taxable = min(remaining, band["upper"] - prev)
-        if taxable <= 0:
-            break
-        tax += taxable * band["rate"]
-        remaining -= taxable
-        prev = band["upper"]
-    return max(0, tax - KE_PERSONAL_RELIEF)
+def get_fallback_rate(annual_income: float) -> float:
+    if annual_income <= 10000:
+        return 0.05
+    elif annual_income <= 25000:
+        return 0.12
+    elif annual_income <= 50000:
+        return 0.18
+    elif annual_income <= 100000:
+        return 0.24
+    elif annual_income <= 200000:
+        return 0.30
+    return 0.35
 
 
-def calculate_ke_nhif(monthly_gross: float) -> float:
-    for tier in KE_NHIF_TABLE:
-        if monthly_gross <= tier["max"]:
-            return tier["amount"]
-    return 1700
+def calculate_social_contributions(country: str, config: dict, annual: float) -> float:
+    """Calculate social security / contributions for known countries."""
+    social = 0.0
+
+    if country == "US":
+        ss = min(annual, config["social_security_cap"]) * config["social_security_rate"]
+        medicare = annual * config["medicare_rate"]
+        social = ss + medicare
+    elif country == "GB":
+        social = max(0, annual - config["ni_threshold"]) * config["ni_rate"]
+    elif country == "CA":
+        cpp = min(annual, config["cpp_cap"]) * config["cpp_rate"]
+        ei = annual * config["ei_rate"]
+        social = cpp + ei
+    elif country == "AU":
+        social = annual * config["medicare_levy"]
+    elif country in ("DE", "FR"):
+        social = annual * config["social_security_rate"]
+    elif country == "ZA":
+        social = min(annual, config["uif_cap"]) * config["uif_rate"]
+    elif country == "GH":
+        social = annual * config["ssnit_rate"]
+    elif country in ("UG", "TZ"):
+        social = annual * config["nssf_rate"]
+    elif country == "RW":
+        social = annual * config["rssb_rate"]
+    elif country == "ET":
+        social = annual * config["pension_rate"]
+    elif country == "IN":
+        social = min(annual, config["pf_cap"]) * config["pf_rate"]
+    elif country == "SG":
+        social = annual * config["cpf_rate"]
+
+    return social
 
 
-def calculate_ke_nssf(monthly_gross: float) -> dict:
-    tier1 = min(monthly_gross, 7000) * 0.06
-    tier2 = max(0, min(monthly_gross, 36000) - 7000) * 0.06
-    return {"tier1": tier1, "tier2": tier2, "total": tier1 + tier2}
+# ─────────────────────────────────────────────────────────────────────────────
+# Views
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TaxSettingsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _get_or_create_settings(self, user):
+        obj, _ = TaxSettings.objects.get_or_create(
+            user=user,
+            defaults={
+                "country": "Kenya",
+                "country_code": "KE",
+                "tax_year": date.today().year,
+            },
+        )
+        return obj
+
+    def get(self, request):
+        return Response(
+            TaxSettingsSerializer(self._get_or_create_settings(request.user)).data
+        )
+
+    def patch(self, request):
+        obj = self._get_or_create_settings(request.user)
+        serializer = TaxSettingsSerializer(obj, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(
+            {"error": "Invalid data.", "details": serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
 
-def calculate_ke_housing_levy(monthly_gross: float) -> dict:
-    levy = monthly_gross * 0.015
-    relief = min(levy * 0.15, 9000)
-    return {"levy": levy, "relief": relief}
-
-
-# ─────────────────────────────────────────────
-# VIEW
-# ─────────────────────────────────────────────
 class TaxCalculateView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        # Accept both old-style (gross_monthly, country) and
+        # new-style (employment_type, gross_monthly_salary, country_code) payloads
         data = request.data
-        gross_monthly = float(data.get("gross_monthly", 0))
-        side_income = float(data.get("side_hustle_income", 0))
+        country_code = (
+            data.get("country_code") or data.get("country", "KE")
+        ).upper()
         employment_type = data.get("employment_type", "employed")
-        country = data.get("country", "KE").upper()
+        tax_year = int(data.get("tax_year", date.today().year))
 
-        total_monthly = side_income if employment_type == "self_employed" else gross_monthly
-        annual_income = total_monthly * 12
+        # ── KENYA — use the precise KRA engine ───────────────────────────────
+        if country_code == "KE":
+            return self._calculate_kenya(request, data, employment_type, tax_year)
 
-        # ── KENYA ──────────────────────────────
-        if country == "KE":
-            return self._calculate_kenya(
-                total_monthly, annual_income, employment_type, side_income
-            )
-
-        # ── KNOWN COUNTRY ──────────────────────
-        if country in COUNTRY_TAX_CONFIGS:
+        # ── KNOWN COUNTRY — use configured bands ─────────────────────────────
+        if country_code in COUNTRY_TAX_CONFIGS:
             return self._calculate_known_country(
-                country, total_monthly, annual_income
+                request, country_code, data, employment_type, tax_year
             )
 
-        # ── FALLBACK ───────────────────────────
-        return self._calculate_fallback(country, total_monthly, annual_income)
+        # ── FALLBACK ─────────────────────────────────────────────────────────
+        return self._calculate_fallback(request, country_code, data, tax_year)
 
-    def _calculate_kenya(self, monthly, annual, employment_type, side_income):
-        paye = calculate_ke_paye(monthly)
-        nhif = calculate_ke_nhif(monthly)
-        nssf = calculate_ke_nssf(monthly)
-        housing = calculate_ke_housing_levy(monthly)
+    # ── Kenya ─────────────────────────────────────────────────────────────────
 
-        total_deductions = paye + nhif + nssf["total"] + housing["levy"]
+    def _calculate_kenya(self, request, data, employment_type, tax_year):
+        gross_monthly = float(
+            data.get("gross_monthly_salary") or data.get("gross_monthly", 0)
+        )
+        annual_revenue = float(
+            data.get("annual_business_revenue") or
+            data.get("side_hustle_income", 0) * 12
+        )
+
+        if employment_type == "employed":
+            result = calculate_employed(gross_monthly)
+            breakdown = result.to_dict()
+            net_paye = result.net_paye
+            nhif = result.nhif
+            nssf = result.nssf_total
+            housing_levy = result.housing_levy
+            net_pay = result.net_pay
+            effective_rate = result.effective_rate
+            gross_m = result.gross_monthly
+
+        elif employment_type == "self_employed":
+            result = calculate_self_employed(annual_revenue)
+            breakdown = result.to_dict()
+            gross_m = d(annual_revenue) / 12
+            net_paye = d(0)
+            nhif = d(0)
+            nssf = d(0)
+            housing_levy = d(0)
+            net_pay = gross_m - result.monthly_turnover_tax
+            effective_rate = (
+                result.monthly_turnover_tax / gross_m * 100
+                if gross_m > 0 else d(0)
+            )
+
+        else:  # both
+            combined = calculate_combined(gross_monthly, annual_revenue)
+            breakdown = combined
+            emp = calculate_employed(gross_monthly)
+            biz = calculate_self_employed(annual_revenue)
+            gross_m = emp.gross_monthly + d(annual_revenue) / 12
+            net_paye = emp.net_paye
+            nhif = emp.nhif
+            nssf = emp.nssf_total
+            housing_levy = emp.housing_levy
+            net_pay = emp.net_pay - biz.monthly_turnover_tax
+            effective_rate = emp.effective_rate
+
+        self._save_history(
+            request.user, "KE", employment_type, tax_year,
+            gross_m, breakdown, net_paye, nhif, nssf, housing_levy,
+            net_pay, effective_rate,
+        )
+
+        return Response({
+            "country_code": "KE",
+            "country_name": "Kenya",
+            "currency": "KES",
+            "employment_type": employment_type,
+            "tax_year": tax_year,
+            "breakdown": breakdown,
+            "summary": {
+                "gross_monthly_income": str(gross_m),
+                "net_paye": str(net_paye),
+                "nhif": str(nhif),
+                "nssf": str(nssf),
+                "housing_levy": str(housing_levy),
+                "net_pay": str(net_pay),
+                "effective_tax_rate_percent": str(effective_rate),
+            },
+            "disclaimer": (
+                "KRA 2024/2025 rates. Verify with your employer or a certified "
+                "tax advisor before filing."
+            ),
+        })
+
+    # ── Known country ─────────────────────────────────────────────────────────
+
+    def _calculate_known_country(self, request, country_code, data, employment_type, tax_year):
+        config = COUNTRY_TAX_CONFIGS[country_code]
+        monthly = float(
+            data.get("gross_monthly_salary") or data.get("gross_monthly", 0)
+        )
+        annual = monthly * 12
+
+        # Apply deductions/reliefs
+        standard_deduction = config.get("standard_deduction", 0)
+        basic_personal = config.get("basic_personal_amount", 0)
+        consolidated_relief = config.get("consolidated_relief", 0)
+        primary_rebate = config.get("primary_rebate", 0)
+
+        taxable_annual = max(
+            0, annual - standard_deduction - basic_personal - consolidated_relief
+        )
+        income_tax_annual = max(
+            0,
+            calculate_progressive_tax(taxable_annual, config["bands"]) - primary_rebate
+        )
+        income_tax_monthly = income_tax_annual / 12
+
+        social_annual = calculate_social_contributions(country_code, config, annual)
+        social_monthly = social_annual / 12
+
+        total_deductions = income_tax_monthly + social_monthly
         net_pay = monthly - total_deductions
         effective_rate = (total_deductions / monthly * 100) if monthly > 0 else 0
 
-        turnover_tax = None
-        if employment_type == "self_employed" and side_income * 12 < 25_000_000:
-            turnover_tax = {
-                "monthly": round(side_income * 0.015),
-                "annual": round(side_income * 0.015 * 12),
-                "label": "Turnover Tax (1.5%)",
-            }
-
-        result = {
-            "country": "KE",
-            "country_name": "Kenya",
-            "currency": "KES",
-            "gross_monthly": monthly,
-            "gross_annual": annual,
-            "employment_type": employment_type,
-            "deductions": {
-                "paye": {
-                    "monthly": round(paye),
-                    "annual": round(paye * 12),
-                    "label": "PAYE Income Tax",
-                },
-                "nhif": {
-                    "monthly": nhif,
-                    "annual": nhif * 12,
-                    "label": "NHIF (SHA)",
-                },
-                "nssf_tier1": {
-                    "monthly": round(nssf["tier1"]),
-                    "annual": round(nssf["tier1"] * 12),
-                    "label": "NSSF Tier I",
-                },
-                "nssf_tier2": {
-                    "monthly": round(nssf["tier2"]),
-                    "annual": round(nssf["tier2"] * 12),
-                    "label": "NSSF Tier II",
-                },
-                "housing_levy": {
-                    "monthly": round(housing["levy"]),
-                    "annual": round(housing["levy"] * 12),
-                    "label": "Housing Levy (1.5%)",
-                },
-            },
-            "reliefs": {
-                "personal_relief": {
-                    "monthly": KE_PERSONAL_RELIEF,
-                    "annual": KE_PERSONAL_RELIEF * 12,
-                    "label": "Personal Relief",
-                },
-                "housing_relief": {
-                    "monthly": round(housing["relief"]),
-                    "annual": round(housing["relief"] * 12),
-                    "label": "Housing Levy Relief (15%)",
-                },
-            },
-            "totals": {
-                "total_deductions": round(total_deductions),
-                "total_deductions_annual": round(total_deductions * 12),
-                "net_pay": round(net_pay),
-                "net_pay_annual": round(net_pay * 12),
-                "effective_rate": round(effective_rate, 1),
-                "marginal_rate": get_marginal_rate(monthly, KE_PAYE_BANDS),
-            },
-            "notes": "KRA 2024/2025 rates. Includes PAYE, NHIF(SHA), NSSF, Housing Levy.",
-        }
-
-        if turnover_tax:
-            result["turnover_tax"] = turnover_tax
-
-        return Response(result, status=status.HTTP_200_OK)
-
-    def _calculate_known_country(self, country, monthly, annual):
-        config = COUNTRY_TAX_CONFIGS[country]
-        bands = config["bands"]
-
-        # Tax is calculated on annual income
-        income_tax_annual = calculate_progressive_tax(annual, bands)
-
-        # Apply deductions/reliefs if configured
-        standard_deduction = config.get("standard_deduction", 0)
-        basic_personal = config.get("basic_personal_amount", 0)
-        primary_rebate = config.get("primary_rebate", 0)
-        consolidated_relief = config.get("consolidated_relief", 0)
-
-        taxable_annual = max(0, annual - standard_deduction - basic_personal - consolidated_relief)
-        income_tax_annual = max(0, calculate_progressive_tax(taxable_annual, bands) - primary_rebate)
-        income_tax_monthly = income_tax_annual / 12
-
-        # Social contributions
-        social_monthly = 0
-
-        # US: Social Security + Medicare
-        if country == "US":
-            ss = min(annual, config["social_security_cap"]) * config["social_security_rate"]
-            medicare = annual * config["medicare_rate"]
-            social_monthly = (ss + medicare) / 12
-
-        # UK: National Insurance
-        elif country == "GB":
-            ni_annual = max(0, annual - config["ni_threshold"]) * config["ni_rate"]
-            social_monthly = ni_annual / 12
-
-        # Canada: CPP + EI
-        elif country == "CA":
-            cpp = min(annual, config["cpp_cap"]) * config["cpp_rate"]
-            ei = annual * config["ei_rate"]
-            social_monthly = (cpp + ei) / 12
-
-        # Australia: Medicare Levy
-        elif country == "AU":
-            social_monthly = annual * config["medicare_levy"] / 12
-
-        # Germany: Social Security
-        elif country == "DE":
-            social_monthly = annual * config["social_security_rate"] / 12
-
-        # South Africa: UIF
-        elif country == "ZA":
-            uif = min(annual, config["uif_cap"]) * config["uif_rate"]
-            social_monthly = uif / 12
-
-        # Ghana: SSNIT
-        elif country == "GH":
-            social_monthly = annual * config["ssnit_rate"] / 12
-
-        # Uganda/Tanzania: NSSF
-        elif country in ("UG", "TZ"):
-            social_monthly = annual * config["nssf_rate"] / 12
-
-        # Rwanda: RSSB
-        elif country == "RW":
-            social_monthly = annual * config["rssb_rate"] / 12
-
-        # Ethiopia: Pension
-        elif country == "ET":
-            social_monthly = annual * config["pension_rate"] / 12
-
-        # India: PF
-        elif country == "IN":
-            pf_annual = min(annual, config["pf_cap"]) * config["pf_rate"]
-            social_monthly = pf_annual / 12
-
-        # Singapore: CPF
-        elif country == "SG":
-            social_monthly = annual * config["cpf_rate"] / 12
-
-        # France: Social Security
-        elif country == "FR":
-            social_monthly = annual * config["social_security_rate"] / 12
-
-        total_deductions_monthly = income_tax_monthly + social_monthly
-        net_pay_monthly = monthly - total_deductions_monthly
-        effective_rate = (total_deductions_monthly / monthly * 100) if monthly > 0 else 0
+        self._save_history(
+            request.user, country_code, employment_type, tax_year,
+            d(monthly), {}, d(income_tax_monthly), d(0), d(social_monthly),
+            d(0), d(net_pay), d(effective_rate),
+        )
 
         return Response({
-            "country": country,
+            "country_code": country_code,
             "country_name": config["name"],
             "currency": config["currency"],
-            "gross_monthly": round(monthly, 2),
-            "gross_annual": round(annual, 2),
+            "employment_type": employment_type,
+            "tax_year": tax_year,
             "deductions": {
                 "income_tax": {
                     "monthly": round(income_tax_monthly, 2),
@@ -569,47 +513,139 @@ class TaxCalculateView(APIView):
                 },
                 "social_contributions": {
                     "monthly": round(social_monthly, 2),
-                    "annual": round(social_monthly * 12, 2),
+                    "annual": round(social_annual, 2),
                     "label": "Social Security / Contributions",
                 },
             },
-            "totals": {
-                "total_deductions": round(total_deductions_monthly, 2),
-                "total_deductions_annual": round(total_deductions_monthly * 12, 2),
-                "net_pay": round(net_pay_monthly, 2),
-                "net_pay_annual": round(net_pay_monthly * 12, 2),
-                "effective_rate": round(effective_rate, 1),
-                "marginal_rate": get_marginal_rate(annual, bands),
+            "summary": {
+                "gross_monthly_income": round(monthly, 2),
+                "total_deductions": round(total_deductions, 2),
+                "net_pay": round(net_pay, 2),
+                "net_pay_annual": round(net_pay * 12, 2),
+                "effective_tax_rate_percent": round(effective_rate, 1),
+                "marginal_rate_percent": get_marginal_rate(annual, config["bands"]),
             },
             "notes": config.get("notes", ""),
-        }, status=status.HTTP_200_OK)
+            "disclaimer": "Rates are approximate. Consult a local tax advisor for accuracy.",
+        })
 
-    def _calculate_fallback(self, country, monthly, annual):
-        # Estimate USD equivalent (rough fallback)
-        estimated_rate = get_fallback_rate(annual)
-        estimated_tax_monthly = monthly * estimated_rate
-        net_pay = monthly - estimated_tax_monthly
+    # ── Fallback ──────────────────────────────────────────────────────────────
+
+    def _calculate_fallback(self, request, country_code, data, tax_year):
+        monthly = float(
+            data.get("gross_monthly_salary") or data.get("gross_monthly", 0)
+        )
+        annual = monthly * 12
+        rate = get_fallback_rate(annual)
+        estimated_tax = monthly * rate
+        net_pay = monthly - estimated_tax
 
         return Response({
-            "country": country,
+            "country_code": country_code,
             "country_name": "Unknown",
             "currency": "Local currency",
-            "gross_monthly": monthly,
-            "gross_annual": annual,
+            "tax_year": tax_year,
             "deductions": {
                 "estimated_tax": {
-                    "monthly": round(estimated_tax_monthly, 2),
-                    "annual": round(estimated_tax_monthly * 12, 2),
+                    "monthly": round(estimated_tax, 2),
+                    "annual": round(estimated_tax * 12, 2),
                     "label": "Estimated Income Tax",
                 },
             },
-            "totals": {
-                "total_deductions": round(estimated_tax_monthly, 2),
-                "total_deductions_annual": round(estimated_tax_monthly * 12, 2),
+            "summary": {
+                "gross_monthly_income": round(monthly, 2),
                 "net_pay": round(net_pay, 2),
-                "net_pay_annual": round(net_pay * 12, 2),
-                "effective_rate": round(estimated_rate * 100, 1),
-                "marginal_rate": round(estimated_rate * 100, 1),
+                "effective_tax_rate_percent": round(rate * 100, 1),
             },
-            "notes": f"Estimated tax for {country}. Exact rates not yet configured. Results are approximate.",
-        }, status=status.HTTP_200_OK)
+            "notes": (
+                f"Tax rates for {country_code} are not yet configured. "
+                "This is a rough estimate only. Consult your local tax authority."
+            ),
+        })
+
+    # ── Save to history ───────────────────────────────────────────────────────
+
+    def _save_history(
+        self, user, country_code, employment_type, tax_year,
+        gross_monthly, breakdown, net_paye, nhif, nssf,
+        housing_levy, net_pay, effective_rate,
+    ):
+        try:
+            TaxCalculation.objects.create(
+                user=user,
+                country_code=country_code,
+                employment_type=employment_type,
+                tax_year=tax_year,
+                gross_monthly_income=gross_monthly,
+                breakdown=breakdown if isinstance(breakdown, dict) else {},
+                net_paye=net_paye,
+                nhif=nhif,
+                nssf=nssf,
+                housing_levy=housing_levy,
+                net_pay=net_pay,
+                effective_tax_rate=effective_rate,
+            )
+        except Exception as e:
+            logger.warning("Failed to save tax calculation history: %s", e)
+
+
+class TaxHistoryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        calculations = TaxCalculation.objects.filter(
+            user=request.user
+        ).order_by("-created_at")[:20]
+        serializer = TaxCalculationHistorySerializer(calculations, many=True)
+        return Response({
+            "calculations": serializer.data,
+            "count": calculations.count(),
+        })
+
+
+class TaxRatesView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        paye_bands = [
+            {
+                "from": str(lower),
+                "to": str(upper) if upper else "Above",
+                "rate": f"{rate * 100:.1f}%",
+            }
+            for lower, upper, rate in PAYE_BANDS
+        ]
+        nhif_tiers = [
+            {
+                "income_from": str(lower),
+                "income_to": str(upper) if upper else "Above",
+                "deduction": str(amount),
+            }
+            for lower, upper, amount in NHIF_TIERS
+        ]
+        supported_countries = [
+            {"code": code, "name": cfg["name"], "currency": cfg["currency"]}
+            for code, cfg in COUNTRY_TAX_CONFIGS.items()
+        ]
+        return Response({
+            "kenya": {
+                "authority": "Kenya Revenue Authority (KRA)",
+                "tax_year": "2024/2025",
+                "paye_bands": paye_bands,
+                "personal_relief_monthly": str(PERSONAL_RELIEF_MONTHLY),
+                "nhif_tiers": nhif_tiers,
+                "nssf": {
+                    "tier1_max_monthly": str(NSSF_TIER_1_MAX),
+                    "tier2_max_monthly": str(NSSF_TIER_2_MAX),
+                    "rate": "6% per tier",
+                },
+                "housing_levy": "1.5% of gross salary",
+                "housing_levy_relief": "15% of levy paid (max KES 108,000/year)",
+                "turnover_tax": f"{TURNOVER_TAX_RATE * 100:.1f}% (revenue < KES 25M/year)",
+                "vat": "16% standard rate (registration if supplies > KES 5M/year)",
+                "last_updated": "2024-07-01",
+                "source": "kra.go.ke",
+            },
+            "supported_countries": supported_countries,
+            "total_countries_supported": len(supported_countries),
+        })
